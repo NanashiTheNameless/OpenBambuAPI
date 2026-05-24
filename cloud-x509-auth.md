@@ -14,19 +14,23 @@ See also: [Hackaday: X.509 Certificate and Private Key Extracted](https://hackad
 ### 1. Request Device Certificate
 
 ```
-GET /v1/iot-service/api/user/applications/{appToken}/cert?aes256={encrypted}
+GET /v1/iot-service/api/user/applications/{appToken}/cert?aes256={encrypted}&ver=1
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `appToken` | path | Base64url-encoded application token (generated client-side) |
 | `aes256` | query | AES-256 encrypted payload containing device identity |
+| `ver` | query | Endpoint version selector; observed value is `1` |
 
 The app token is a long base64url string (100+ chars). The AES payload is similarly encoded.
 
+Recent slicer builds are observed to always include `&ver=1` as an
+additional query parameter; the endpoint appears to require it.
+
 **Example URL (tokens redacted):**
 ```
-https://api.bambulab.com/v1/iot-service/api/user/applications/QqTHQ6X9gFy9...=/cert?aes256=ViXLbxLlpySi...
+https://api.bambulab.com/v1/iot-service/api/user/applications/QqTHQ6X9gFy9...=/cert?aes256=ViXLbxLlpySi...&ver=1
 ```
 
 **Response:** X.509 certificate and private key for the specific printer.
@@ -101,7 +105,16 @@ The `cert_id` format is:
 ```
 
 Where:
-- `hex_fingerprint` is a 32-char hex string (MD5 of the certificate)
+- `hex_fingerprint` is a 32-char lowercase hex string. In captured envelopes
+  captured this matched the leaf certificate's
+  `tbsCertificate.serialNumber` rather than an MD5 over the cert. You can
+  check against your own capture with:
+
+  ```sh
+  # leaf.pem = the cert the client presented for this session
+  openssl x509 -in leaf.pem -serial -noout
+  # → the hex value should match the cert_id prefix (before any CN= suffix)
+  ```
 - `serialNumber` is the printer's serial number (e.g., `GLOF3813734089`)
 
 ## Signing Details
@@ -118,6 +131,111 @@ The `sign_string` is computed by:
 1. Serializing the command payload (everything except `header`) as JSON
 2. Signing with RSA-SHA256 using the private key from the certificate exchange
 3. Base64-encoding the signature
+
+## Envelope Construction
+
+The notes below cover the exact construction used to build a `header`
+envelope that the firmware accepts, so an independent client can
+produce byte-identical envelopes. The shape was deterministic across
+multiple captured envelopes from different slicer sessions.
+
+### Header field semantics
+
+| Field | Value type | Derivation |
+|---|---|---|
+| `sign_ver` | string | `"v1.0"` (only value observed) |
+| `sign_alg` | string | `"RSA_SHA256"` (RSA PKCS#1 v1.5 padding, SHA-256 digest) |
+| `cert_id` | string | leaf certificate's `tbsCertificate.serialNumber` as a lowercase 32-char hex string, optionally suffixed with `CN=<leaf-host>` (see "Certificate ID Format" above) |
+| `payload_len` | integer | byte length of the canonical bytes-to-sign described below |
+| `sign_string` | string | base64 of the RSA-SHA256 signature over the canonical bytes-to-sign |
+
+### Canonical bytes-to-sign
+
+The signing input is reconstructed from the top-level command class
+(only `print` has been observed to require signing, per the auth
+requirements table further down) and a canonicalised JSON
+serialisation of the inner object:
+
+```
+bytes_to_sign = '{"<top-key>":' + canonical_json(envelope[<top-key>]) + '}'
+```
+
+where `canonical_json()` is JSON serialised with:
+
+- keys sorted alphabetically (recursively, at every depth)
+- no whitespace anywhere
+- `,` and `:` as the only separators
+
+In Python this matches:
+
+```python
+json.dumps(payload, sort_keys=True, separators=(",", ":"))
+```
+
+`payload_len` is then the byte length of the resulting `bytes_to_sign`
+string (UTF-8 / ASCII, since the canonical form contains no
+non-ASCII bytes for any observed envelope).
+
+### Verification recipe
+
+The construction can be verified end-to-end against a captured envelope
+and the corresponding leaf certificate (selected via the `cert_id`
+prefix):
+
+```python
+import base64, json
+from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.x509 import load_pem_x509_certificate
+
+env = json.load(open("envelope.json"))
+cert = load_pem_x509_certificate(open("leaf.pem", "rb").read())
+pubkey = cert.public_key()
+
+canonical_inner = json.dumps(env["print"], sort_keys=True,
+                             separators=(",", ":"))
+to_sign = b'{"print":' + canonical_inner.encode() + b"}"
+
+assert len(to_sign) == env["header"]["payload_len"]
+sig = base64.b64decode(env["header"]["sign_string"])
+pubkey.verify(sig, to_sign, PKCS1v15(), SHA256())
+print("Signature verified.")
+```
+
+Corrections welcome if the canonicalisation differs for other
+command classes or firmware tracks not yet captured.
+
+## Per-Printer Client Certificates
+
+> The notes below are from observing a slicer talk to a single printer over LAN MQTT; some of this may be incomplete or wrong for other firmware tracks. Contributions / corrections are always welcome.
+
+The cert returned by the `/cert` endpoint above is a per-printer client certificate. Observations about the certificate:
+- The leaf has `CN=<printer serial>` and chains up to BBL CA (the same chain bundled in [`examples/ca_cert.pem`](./examples/ca_cert.pem)).
+- It appears to be long-lived (the leaves I've looked at have ~10-year validity windows).
+- The printer firmware appears to accept any client cert that chains to BBL CA and whose CN matches its own serial; I haven't found other constraints.
+
+A given slicer install ends up holding one such cert+key per printer it has been bound to.
+
+### Where it's used
+
+The cert+key is presented during the TLS handshake to the printer's MQTT broker (`mqtts://<printer-ip>:8883`). It is *separate* from the `bblp` / LAN access code username+password, which is checked after the TLS handshake completes.
+
+### Auth requirements per command class
+
+For local MQTT, the cert+key on the TLS handshake is one layer; the `header`-signed envelope described above is a second layer that only some command classes require. Best guess from captured slicer traffic:
+
+| Top-level JSON key | TLS client cert+key | Signed envelope (`header`) | Firmware response if envelope missing/bad |
+|---|---|---|---|
+| `pushing.*` / `info.*` | Required to subscribe to `/report`; publish accepted with cert+key alone | No | n/a |
+| `system.*` / `camera.*` / `xcam.*` | Required (broker rejects the TLS handshake otherwise) | No | n/a |
+| `print.*` (publish to `/request`) | Required | Required | `result:"failed"`, `reason:"mqtt message verify failed"`, `err_code:0x05024007` if no envelope; `0x05024009` if envelope is present but malformed |
+| `print.*` (subscribe via `/report`) | Required | n/a | n/a |
+
+The two `err_code` values above seem to be firmware-defined and are easy to misattribute to credential or topic-ACL problems, so they're probably worth knowing about when implementing a client.
+
+### Obtaining the cert+key for testing
+
+If you have your own slicer install bound to your own printer, the per-printer cert+key can be recovered without modifying the slicer or its plugin: after the slicer has connected to the printer at least once, the leaf cert and private key live in the network plugin process's heap in PEM form, and can be recovered by scanning anonymous-memory regions of `/proc/<pid>/mem` for `-----BEGIN CERTIFICATE-----` and `-----BEGIN PRIVATE KEY-----` markers (ptrace is sufficient; no plugin patching required). This is the currently known user-facing extraction method. If others are found, PRs welcome!
 
 ## Additional MQTT Commands Observed
 
